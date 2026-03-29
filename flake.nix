@@ -27,8 +27,8 @@
 					nodePackages.prettier
 				];
 			shellHook = ''
-			echo "--- Hugo Dev Environment active ---"
-			hugo version
+			echo "Go Development Env ready"
+			go version
 			'';
 			};
 		}
