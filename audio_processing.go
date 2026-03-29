@@ -19,6 +19,8 @@ var (
 	spectrumFrequencies = []float64{60, 120, 250, 500, 1000, 2000, 4000, 8000, 12000, 16000}
 )
 
+const spectrumComputeEvery = 4
+
 type volumeStreamer struct {
 	mu     sync.RWMutex
 	source beep.Streamer
@@ -141,6 +143,7 @@ type equalizer struct {
 	rate   beep.SampleRate
 	bands  []eqBand
 	dirty  bool
+	bypass bool
 }
 
 func newEqualizer(freqs []float64, q float64) *equalizer {
@@ -148,7 +151,7 @@ func newEqualizer(freqs []float64, q float64) *equalizer {
 	for i, freq := range freqs {
 		bands[i] = eqBand{freq: freq, q: q}
 	}
-	return &equalizer{bands: bands, dirty: true}
+	return &equalizer{bands: bands, dirty: true, bypass: true}
 }
 
 func (e *equalizer) SetSource(source beep.Streamer) {
@@ -171,6 +174,7 @@ func (e *equalizer) SetGain(band int, gainDB float64) {
 	if band >= 0 && band < len(e.bands) {
 		e.bands[band].gainDB = clampFloat(gainDB, minEQGainDB, maxEQGainDB)
 		e.dirty = true
+		e.updateBypassLocked()
 	}
 	e.mu.Unlock()
 }
@@ -181,6 +185,7 @@ func (e *equalizer) SetGains(gains []float64) {
 		e.bands[i].gainDB = clampFloat(gains[i], minEQGainDB, maxEQGainDB)
 	}
 	e.dirty = true
+	e.updateBypassLocked()
 	e.mu.Unlock()
 }
 
@@ -199,9 +204,13 @@ func (e *equalizer) applyCoefficients() {
 func (e *equalizer) Stream(samples [][2]float64) (int, bool) {
 	e.mu.RLock()
 	source := e.source
+	bypass := e.bypass
 	e.mu.RUnlock()
 	if source == nil {
 		return 0, false
+	}
+	if bypass {
+		return source.Stream(samples)
 	}
 	n, ok := source.Stream(samples)
 	if n == 0 {
@@ -223,6 +232,18 @@ func (e *equalizer) Stream(samples [][2]float64) (int, bool) {
 	return n, ok
 }
 
+func (e *equalizer) updateBypassLocked() {
+	const epsilon = 1e-6
+	bypass := true
+	for i := range e.bands {
+		if math.Abs(e.bands[i].gainDB) > epsilon {
+			bypass = false
+			break
+		}
+	}
+	e.bypass = bypass
+}
+
 func (e *equalizer) Err() error {
 	e.mu.RLock()
 	source := e.source
@@ -237,19 +258,24 @@ func (e *equalizer) Err() error {
 }
 
 type spectrumAnalyzer struct {
-	mu          sync.RWMutex
-	source      beep.Streamer
-	sampleRate  beep.SampleRate
-	frequencies []float64
-	buffer      []float64
-	bufPos      int
-	levels      []float64
+	mu           sync.RWMutex
+	source       beep.Streamer
+	sampleRate   beep.SampleRate
+	frequencies  []float64
+	buffer       []float64
+	bufPos       int
+	levels       []float64
+	enabled      bool
+	computeEvery int
+	computeCount int
 }
 
 func newSpectrumAnalyzer(freqs []float64, rate beep.SampleRate, windowSize int) *spectrumAnalyzer {
 	a := &spectrumAnalyzer{
-		frequencies: freqs,
-		levels:      make([]float64, len(freqs)),
+		frequencies:  freqs,
+		levels:       make([]float64, len(freqs)),
+		enabled:      true,
+		computeEvery: max(1, spectrumComputeEvery),
 	}
 	a.SetSampleRate(rate, windowSize)
 	return a
@@ -269,6 +295,19 @@ func (a *spectrumAnalyzer) SetSampleRate(rate beep.SampleRate, windowSize int) {
 	a.sampleRate = rate
 	a.buffer = make([]float64, windowSize)
 	a.bufPos = 0
+	a.computeCount = 0
+	a.mu.Unlock()
+}
+
+func (a *spectrumAnalyzer) SetEnabled(enabled bool) {
+	a.mu.Lock()
+	a.enabled = enabled
+	if !enabled {
+		for i := range a.levels {
+			a.levels[i] = 0
+		}
+		a.bufPos = 0
+	}
 	a.mu.Unlock()
 }
 
@@ -283,9 +322,13 @@ func (a *spectrumAnalyzer) Snapshot() []float64 {
 func (a *spectrumAnalyzer) Stream(samples [][2]float64) (int, bool) {
 	a.mu.RLock()
 	source := a.source
+	enabled := a.enabled
 	a.mu.RUnlock()
 	if source == nil {
 		return 0, false
+	}
+	if !enabled {
+		return source.Stream(samples)
 	}
 	n, ok := source.Stream(samples)
 	if n == 0 {
@@ -297,7 +340,11 @@ func (a *spectrumAnalyzer) Stream(samples [][2]float64) (int, bool) {
 		a.buffer[a.bufPos] = mono
 		a.bufPos++
 		if a.bufPos >= len(a.buffer) {
-			a.computeLevels()
+			a.computeCount++
+			if a.computeCount >= a.computeEvery {
+				a.computeLevels()
+				a.computeCount = 0
+			}
 			a.bufPos = 0
 		}
 	}

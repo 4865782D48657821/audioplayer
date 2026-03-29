@@ -16,15 +16,23 @@ import (
 	tea "charm.land/bubbletea/v2"
 )
 
+const (
+	resampleQualityDefault  = 4
+	resampleQualityLowPower = 1
+)
+
 type audioPlayer struct {
-	inited   bool
-	rate     beep.SampleRate
-	decoder  beep.StreamSeekCloser
-	volume   *volumeStreamer
-	eq       *equalizer
-	analyzer *spectrumAnalyzer
-	volumeDB float64
-	eqGains  []float64
+	inited          bool
+	rate            beep.SampleRate
+	decoder         beep.StreamSeekCloser
+	volume          *volumeStreamer
+	eq              *equalizer
+	analyzer        *spectrumAnalyzer
+	volumeDB        float64
+	eqGains         []float64
+	spectrumEnabled bool
+	eqEnabled       bool
+	resampleQuality int
 }
 
 type playMsg struct {
@@ -53,7 +61,7 @@ func (p *audioPlayer) Shutdown() {
 	speaker.Close()
 }
 
-func (p *audioPlayer) Play(format beep.Format, stream beep.StreamSeekCloser) error {
+func (p *audioPlayer) Play(format beep.Format, stream beep.StreamSeekCloser, loop bool, done chan<- int, token int) error {
 	rate := format.SampleRate
 	if !p.inited {
 		if err := speaker.Init(rate, rate.N(time.Second/10)); err != nil {
@@ -63,9 +71,20 @@ func (p *audioPlayer) Play(format beep.Format, stream beep.StreamSeekCloser) err
 		p.rate = rate
 	}
 
-	streamer := beep.Streamer(beep.Loop(-1, stream))
+	var streamer beep.Streamer = stream
+	if loop {
+		streamer = beep.Loop(-1, stream)
+	} else if done != nil {
+		streamer = beep.Seq(stream, beep.Callback(func() {
+			_ = stream.Close()
+			select {
+			case done <- token:
+			default:
+			}
+		}))
+	}
 	if p.rate != rate {
-		streamer = beep.Resample(4, rate, p.rate, streamer)
+		streamer = beep.Resample(p.resampleQualityValue(), rate, p.rate, streamer)
 	}
 	streamer = p.chain(streamer)
 	speaker.Play(streamer)
@@ -100,27 +119,49 @@ func (p *audioPlayer) Spectrum() []float64 {
 	return p.analyzer.Snapshot()
 }
 
-func (p *audioPlayer) chain(source beep.Streamer) beep.Streamer {
-	if p.eq == nil {
-		p.eq = newEqualizer(eqFrequencies, 1.0)
+func (p *audioPlayer) SetSpectrumEnabled(enabled bool) {
+	p.spectrumEnabled = enabled
+	if p.analyzer != nil {
+		p.analyzer.SetEnabled(enabled)
 	}
-	p.eq.SetSampleRate(p.rate)
-	p.eq.SetGains(p.eqGains)
-	p.eq.SetSource(source)
+}
+
+func (p *audioPlayer) SetEQEnabled(enabled bool) {
+	p.eqEnabled = enabled
+}
+
+func (p *audioPlayer) chain(source beep.Streamer) beep.Streamer {
+	if p.eqEnabled {
+		if p.eq == nil {
+			p.eq = newEqualizer(eqFrequencies, 1.0)
+		}
+		p.eq.SetSampleRate(p.rate)
+		p.eq.SetGains(p.eqGains)
+		p.eq.SetSource(source)
+		source = p.eq
+	}
 
 	if p.volume == nil {
 		p.volume = newVolumeStreamer(nil, p.volumeDB)
 	}
 	p.volume.SetDB(p.volumeDB)
-	p.volume.SetSource(p.eq)
+	p.volume.SetSource(source)
 
 	if p.analyzer == nil {
 		p.analyzer = newSpectrumAnalyzer(spectrumFrequencies, p.rate, 1024)
 	} else {
 		p.analyzer.SetSampleRate(p.rate, 1024)
 	}
+	p.analyzer.SetEnabled(p.spectrumEnabled)
 	p.analyzer.SetSource(p.volume)
 	return p.analyzer
+}
+
+func (p *audioPlayer) resampleQualityValue() int {
+	if p.resampleQuality <= 0 {
+		return resampleQualityDefault
+	}
+	return p.resampleQuality
 }
 
 func playCmd(dir, name string) tea.Cmd {

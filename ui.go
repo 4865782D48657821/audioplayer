@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"image/color"
 	"math"
+	"math/rand"
 	"path/filepath"
 	"strings"
 	"time"
@@ -93,15 +94,34 @@ type model struct {
 	eqGains      []float64
 	eqSelected   int
 	spectrum     []float64
+	spectrumOn   bool
+	eqOn         bool
+	playMode     playbackMode
+	playOrder    []int
+	playPos      int
+	rng          *rand.Rand
+	doneCh       chan int
+	playToken    int
 }
 
 type tickMsg time.Time
+type trackDoneMsg struct {
+	token int
+}
 
 type viewMode int
 
 const (
 	viewList viewMode = iota
 	viewDetail
+)
+
+type playbackMode int
+
+const (
+	playbackNormal playbackMode = iota
+	playbackLoop
+	playbackShuffle
 )
 
 func newTableModel() table.Model {
@@ -145,8 +165,19 @@ func newTableModel() table.Model {
 	return t
 }
 
-func initialModel(dir string) *model {
+func initialModel(dir string, lowPower bool) *model {
 	eqGains := make([]float64, len(eqFrequencies))
+	spectrumOn := !lowPower
+	eqOn := !lowPower
+	rng := rand.New(rand.NewSource(time.Now().UnixNano()))
+	player := audioPlayer{
+		spectrumEnabled: spectrumOn,
+		eqEnabled:       eqOn,
+		resampleQuality: resampleQualityDefault,
+	}
+	if lowPower {
+		player.resampleQuality = resampleQualityLowPower
+	}
 	return &model{
 		dir:          dir,
 		table:        newTableModel(),
@@ -154,6 +185,12 @@ func initialModel(dir string) *model {
 		playingIndex: -1,
 		viewMode:     viewList,
 		eqGains:      eqGains,
+		spectrumOn:   spectrumOn,
+		eqOn:         eqOn,
+		playMode:     playbackNormal,
+		playPos:      -1,
+		rng:          rng,
+		player:       player,
 	}
 }
 
@@ -162,9 +199,9 @@ func (m *model) Init() tea.Cmd {
 }
 
 func (m model) renderTrackCell(index int, track int) string {
-	prefix := " "
+	prefix := "  "
 	if m.playingIndex == index && m.nowPlaying != "" {
-		prefix = "->"
+		prefix = "▶ "
 	}
 	if track <= 0 {
 		return prefix
@@ -230,6 +267,15 @@ func (m *model) handleReload(msg reloadMsg) tea.Cmd {
 	}
 	m.err = ""
 	m.songs = msg.songs
+	startIndex := -1
+	if m.playingIndex >= 0 && m.playingIndex < len(m.songs) {
+		startIndex = m.playingIndex
+	} else {
+		m.playingIndex = -1
+		m.nowPlaying = ""
+		m.playPos = -1
+	}
+	m.rebuildPlayOrder(startIndex)
 	m.syncTableRows()
 
 	if len(m.songs) > 0 && m.table.Cursor() < 0 {
@@ -257,7 +303,17 @@ func (m *model) handlePlay(msg playMsg) tea.Cmd {
 
 	m.err = ""
 	m.stopAudio()
-	if err := m.player.Play(msg.format, msg.stream); err != nil {
+	if m.doneCh != nil {
+		select {
+		case m.doneCh <- -1:
+		default:
+		}
+	}
+	m.playToken++
+	token := m.playToken
+	m.doneCh = make(chan int, 1)
+	doneCmd := waitTrackDoneCmd(m.doneCh)
+	if err := m.player.Play(msg.format, msg.stream, false, m.doneCh, token); err != nil {
 		_ = msg.stream.Close()
 		m.err = err.Error()
 		return nil
@@ -265,7 +321,182 @@ func (m *model) handlePlay(msg playMsg) tea.Cmd {
 	m.nowPlaying = filepath.Base(msg.path)
 	m.setViewMode(viewDetail)
 	m.syncTableRows()
-	return m.progress.SetPercent(m.playbackPercent())
+	return tea.Batch(m.progress.SetPercent(m.playbackPercent()), doneCmd)
+}
+
+func (m *model) handleTrackDone() tea.Cmd {
+	if len(m.songs) == 0 {
+		return nil
+	}
+	next := m.nextIndex()
+	if next < 0 || next >= len(m.songs) {
+		m.stopAudio()
+		m.playingIndex = -1
+		m.nowPlaying = ""
+		m.playPos = -1
+		m.setViewMode(viewList)
+		m.syncTableRows()
+		return m.progress.SetPercent(0)
+	}
+	m.playingIndex = next
+	m.syncTableRows()
+	return tea.Batch(m.progress.SetPercent(0), playCmd(m.dir, m.songs[next].Filename))
+}
+
+func (m *model) startPlayback(index int) tea.Cmd {
+	if index < 0 || index >= len(m.songs) {
+		return nil
+	}
+	m.playingIndex = index
+	m.setPlayPosition(index)
+	m.syncTableRows()
+	return tea.Batch(m.progress.SetPercent(0), playCmd(m.dir, m.songs[index].Filename))
+}
+
+func (m *model) nextIndex() int {
+	if len(m.songs) == 0 {
+		return -1
+	}
+	if len(m.playOrder) != len(m.songs) {
+		m.rebuildPlayOrder(m.playingIndex)
+	}
+	if len(m.playOrder) == 0 {
+		return -1
+	}
+	switch m.playMode {
+	case playbackShuffle:
+		if m.playPos+1 >= len(m.playOrder) {
+			m.rebuildPlayOrder(-1)
+			if len(m.playOrder) == 0 {
+				return -1
+			}
+			return m.playOrder[0]
+		}
+	case playbackLoop:
+		if m.playPos+1 >= len(m.playOrder) {
+			m.playPos = 0
+			return m.playOrder[m.playPos]
+		}
+	default:
+		if m.playPos+1 >= len(m.playOrder) {
+			return -1
+		}
+	}
+	m.playPos++
+	return m.playOrder[m.playPos]
+}
+
+func (m *model) prevIndex() int {
+	if len(m.songs) == 0 {
+		return -1
+	}
+	if len(m.playOrder) != len(m.songs) {
+		m.rebuildPlayOrder(m.playingIndex)
+	}
+	if len(m.playOrder) == 0 {
+		return -1
+	}
+	if m.playPos-1 < 0 {
+		if m.playMode == playbackLoop || m.playMode == playbackShuffle {
+			m.playPos = len(m.playOrder) - 1
+			return m.playOrder[m.playPos]
+		}
+		return -1
+	}
+	m.playPos--
+	return m.playOrder[m.playPos]
+}
+
+func (m *model) setPlayPosition(index int) {
+	if index < 0 || index >= len(m.songs) {
+		m.playPos = -1
+		return
+	}
+	if m.playMode == playbackShuffle {
+		m.rebuildPlayOrder(index)
+		return
+	}
+	m.playOrder = make([]int, len(m.songs))
+	for i := range m.playOrder {
+		m.playOrder[i] = i
+	}
+	m.playPos = index
+}
+
+func (m *model) rebuildPlayOrder(startIndex int) {
+	if len(m.songs) == 0 {
+		m.playOrder = nil
+		m.playPos = -1
+		return
+	}
+	if m.playMode != playbackShuffle {
+		m.playOrder = make([]int, len(m.songs))
+		for i := range m.playOrder {
+			m.playOrder[i] = i
+		}
+		if startIndex >= 0 && startIndex < len(m.playOrder) {
+			m.playPos = startIndex
+		} else {
+			m.playPos = 0
+		}
+		return
+	}
+
+	order := make([]int, len(m.songs))
+	for i := range order {
+		order[i] = i
+	}
+	if startIndex >= 0 && startIndex < len(order) {
+		order[0], order[startIndex] = order[startIndex], order[0]
+		if len(order) > 1 {
+			m.rng.Shuffle(len(order)-1, func(i, j int) {
+				i++
+				j++
+				order[i], order[j] = order[j], order[i]
+			})
+		}
+		m.playPos = 0
+	} else {
+		m.rng.Shuffle(len(order), func(i, j int) {
+			order[i], order[j] = order[j], order[i]
+		})
+		m.playPos = 0
+	}
+	m.playOrder = order
+}
+
+func (m *model) cyclePlaybackMode() {
+	switch m.playMode {
+	case playbackNormal:
+		m.setPlaybackMode(playbackLoop)
+	case playbackLoop:
+		m.setPlaybackMode(playbackShuffle)
+	default:
+		m.setPlaybackMode(playbackNormal)
+	}
+}
+
+func (m *model) setPlaybackMode(mode playbackMode) {
+	if m.playMode == mode {
+		return
+	}
+	m.playMode = mode
+	startIndex := -1
+	if m.playingIndex >= 0 && m.playingIndex < len(m.songs) {
+		startIndex = m.playingIndex
+	}
+	m.rebuildPlayOrder(startIndex)
+}
+
+func playbackModeLabel(mode playbackMode) string {
+	switch mode {
+	case playbackLoop:
+		return "LOOP"
+	case playbackShuffle:
+		return "SHUFFLE"
+	default:
+		return "NORMAL"
+	}
 }
 
 func (m *model) handleKey(msg tea.KeyPressMsg) tea.Cmd {
@@ -298,6 +529,37 @@ func (m *model) handleKey(msg tea.KeyPressMsg) tea.Cmd {
 		if m.viewMode == viewDetail {
 			m.adjustEQGain(1.5)
 		}
+	case "m":
+		m.cyclePlaybackMode()
+	case "n":
+		if m.playingIndex >= 0 {
+			next := m.nextIndex()
+			if next >= 0 && next < len(m.songs) {
+				m.playingIndex = next
+				m.syncTableRows()
+				return tea.Batch(m.progress.SetPercent(0), playCmd(m.dir, m.songs[next].Filename))
+			}
+		}
+		return nil
+	case "v":
+		if m.playingIndex >= 0 {
+			prev := m.prevIndex()
+			if prev >= 0 && prev < len(m.songs) {
+				m.playingIndex = prev
+				m.syncTableRows()
+				return tea.Batch(m.progress.SetPercent(0), playCmd(m.dir, m.songs[prev].Filename))
+			}
+		}
+		return nil
+	case "e":
+		m.eqOn = !m.eqOn
+		m.player.SetEQEnabled(m.eqOn)
+	case "s":
+		m.spectrumOn = !m.spectrumOn
+		m.player.SetSpectrumEnabled(m.spectrumOn)
+		if !m.spectrumOn {
+			m.spectrum = nil
+		}
 	case "enter", "space", "p":
 		if len(m.songs) == 0 {
 			return nil
@@ -310,14 +572,19 @@ func (m *model) handleKey(msg tea.KeyPressMsg) tea.Cmd {
 		if m.playingIndex == selected && m.nowPlaying != "" {
 			m.nowPlaying = ""
 			m.stopAudio()
+			if m.doneCh != nil {
+				select {
+				case m.doneCh <- -1:
+				default:
+				}
+			}
 			m.playingIndex = -1
+			m.playPos = -1
 			m.setViewMode(viewList)
 			m.syncTableRows()
 			return tea.Batch(reloadCmd(m.dir), m.progress.SetPercent(0))
 		}
-		m.playingIndex = selected
-		m.syncTableRows()
-		return tea.Batch(m.progress.SetPercent(0), playCmd(m.dir, m.songs[selected].Filename))
+		return m.startPlayback(selected)
 	}
 	return nil
 }
@@ -329,6 +596,11 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, m.handleReload(msg)
 	case playMsg:
 		return m, m.handlePlay(msg)
+	case trackDoneMsg:
+		if msg.token != m.playToken {
+			return m, nil
+		}
+		return m, m.handleTrackDone()
 	case tea.KeyPressMsg:
 		if m.viewMode == viewList && isListNavKey(msg) {
 			var cmd tea.Cmd
@@ -352,7 +624,11 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tickMsg:
 		cmds := []tea.Cmd{tickCmd()}
 		if m.nowPlaying != "" {
-			m.spectrum = m.player.Spectrum()
+			if m.spectrumOn {
+				m.spectrum = m.player.Spectrum()
+			} else {
+				m.spectrum = nil
+			}
 			cmds = append(cmds, m.progress.SetPercent(m.playbackPercent()))
 		}
 		return m, tea.Batch(cmds...)
@@ -379,7 +655,7 @@ func (m *model) View() tea.View {
 			m.renderVolume(),
 			m.renderEQ(),
 		)
-		if len(m.spectrum) > 0 {
+		if m.spectrumOn && len(m.spectrum) > 0 {
 			body = lipgloss.JoinVertical(lipgloss.Left, body, m.renderSpectrum())
 		}
 	default:
@@ -447,6 +723,9 @@ func (m *model) renderVolume() string {
 }
 
 func (m *model) renderEQ() string {
+	if !m.eqOn {
+		return labelStyle.Render("EQ") + " " + valueStyle.Render("(off)")
+	}
 	if len(m.eqGains) == 0 {
 		return labelStyle.Render("EQ") + " " + valueStyle.Render("(none)")
 	}
@@ -540,7 +819,8 @@ func (m *model) renderHeader() string {
 		badgeStyle.Render("AUDIO"),
 		titleStyle.Render("PLAYER"),
 	)
-	right := labelStyle.Render("MODE") + " " + valueStyle.Render(mode)
+	right := labelStyle.Render("MODE") + " " + valueStyle.Render(mode) + "  " +
+		labelStyle.Render("PLAY") + " " + valueStyle.Render(playbackModeLabel(m.playMode))
 	return lipgloss.JoinHorizontal(lipgloss.Left, left, "  ", right)
 }
 
@@ -555,6 +835,10 @@ func (m *model) renderHelp() string {
 				keyStyle.Render("R") + " rescan  " +
 				keyStyle.Render("Q") + " quit  " +
 				keyStyle.Render("+/-") + " vol  " +
+				keyStyle.Render("M") + " mode  " +
+				keyStyle.Render("N/V") + " next/prev  " +
+				keyStyle.Render("E") + " eq  " +
+				keyStyle.Render("S") + " spectrum  " +
 				keyStyle.Render("H/L") + " band  " +
 				keyStyle.Render("J/K") + " gain",
 		)
@@ -564,6 +848,10 @@ func (m *model) renderHelp() string {
 			keyStyle.Render("R") + " rescan  " +
 			keyStyle.Render("Q") + " quit  " +
 			keyStyle.Render("+/-") + " vol  " +
+			keyStyle.Render("M") + " mode  " +
+			keyStyle.Render("N/V") + " next/prev  " +
+			keyStyle.Render("E") + " eq  " +
+			keyStyle.Render("S") + " spectrum  " +
 			keyStyle.Render("H/L") + " band  " +
 			keyStyle.Render("J/K") + " gain",
 	)
@@ -587,8 +875,15 @@ func isListNavKey(msg tea.KeyPressMsg) bool {
 	}
 }
 
+func waitTrackDoneCmd(done <-chan int) tea.Cmd {
+	return func() tea.Msg {
+		token := <-done
+		return trackDoneMsg{token: token}
+	}
+}
+
 func tickCmd() tea.Cmd {
-	return tea.Tick(time.Millisecond*150, func(t time.Time) tea.Msg {
+	return tea.Tick(time.Millisecond*500, func(t time.Time) tea.Msg {
 		return tickMsg(t)
 	})
 }
