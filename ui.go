@@ -23,15 +23,15 @@ const (
 )
 
 var (
-	colorBezel      = lipgloss.Color("#151515")
-	colorPanel      = lipgloss.Color("#0f140f")
-	colorOlive      = lipgloss.Color("#6c704d")
-	colorOliveDark  = lipgloss.Color("#3f442d")
-	colorLCD        = lipgloss.Color("#b7d6a0")
-	colorLCDMuted   = lipgloss.Color("#6a7b5f")
-	colorAccent     = lipgloss.Color("#f2d21a")
-	colorAccentDark = lipgloss.Color("#b99d11")
-	colorAlert      = lipgloss.Color("#d23b2a")
+	colorBezel      = lipgloss.Color("#1A1A1A")
+	colorPanel      = lipgloss.Color("#1A1A1A")
+	colorOlive      = lipgloss.Color("#4A90E2")
+	colorOliveDark  = lipgloss.Color("#A8B3A2")
+	colorLCD        = lipgloss.Color("#A8B3A2")
+	colorLCDMuted   = lipgloss.Color("#A8B3A2")
+	colorAccent     = lipgloss.Color("#E8B817")
+	colorAccentDark = lipgloss.Color("#4A90E2")
+	colorAlert      = lipgloss.Color("#D10000")
 )
 
 var (
@@ -224,7 +224,7 @@ func (m *model) handleReload(msg reloadMsg) tea.Cmd {
 		m.songs = nil
 		m.playingIndex = -1
 		m.nowPlaying = ""
-		m.viewMode = viewList
+		m.setViewMode(viewList)
 		m.syncTableRows()
 		return nil
 	}
@@ -240,7 +240,7 @@ func (m *model) handleReload(msg reloadMsg) tea.Cmd {
 		m.playingIndex = -1
 		m.nowPlaying = ""
 		m.table.SetCursor(0)
-		m.viewMode = viewList
+		m.setViewMode(viewList)
 	}
 	return nil
 }
@@ -250,7 +250,7 @@ func (m *model) handlePlay(msg playMsg) tea.Cmd {
 		m.err = msg.loadErr.Error()
 		m.playingIndex = -1
 		m.nowPlaying = ""
-		m.viewMode = viewList
+		m.setViewMode(viewList)
 		m.syncTableRows()
 		return m.progress.SetPercent(0)
 	}
@@ -263,7 +263,7 @@ func (m *model) handlePlay(msg playMsg) tea.Cmd {
 		return nil
 	}
 	m.nowPlaying = filepath.Base(msg.path)
-	m.viewMode = viewDetail
+	m.setViewMode(viewDetail)
 	m.syncTableRows()
 	return m.progress.SetPercent(m.playbackPercent())
 }
@@ -276,20 +276,28 @@ func (m *model) handleKey(msg tea.KeyPressMsg) tea.Cmd {
 	case "r":
 		return reloadCmd(m.dir)
 	case "b":
-		m.viewMode = viewList
+		m.setViewMode(viewList)
 		return nil
 	case "-":
 		m.adjustVolume(-2)
 	case "=", "+":
 		m.adjustVolume(2)
 	case "h":
-		m.selectEQBand(-1)
+		if m.viewMode == viewDetail {
+			m.selectEQBand(-1)
+		}
 	case "l":
-		m.selectEQBand(1)
+		if m.viewMode == viewDetail {
+			m.selectEQBand(1)
+		}
 	case "j":
-		m.adjustEQGain(-1.5)
+		if m.viewMode == viewDetail {
+			m.adjustEQGain(-1.5)
+		}
 	case "k":
-		m.adjustEQGain(1.5)
+		if m.viewMode == viewDetail {
+			m.adjustEQGain(1.5)
+		}
 	case "enter", "space", "p":
 		if len(m.songs) == 0 {
 			return nil
@@ -303,7 +311,7 @@ func (m *model) handleKey(msg tea.KeyPressMsg) tea.Cmd {
 			m.nowPlaying = ""
 			m.stopAudio()
 			m.playingIndex = -1
-			m.viewMode = viewList
+			m.setViewMode(viewList)
 			m.syncTableRows()
 			return tea.Batch(reloadCmd(m.dir), m.progress.SetPercent(0))
 		}
@@ -322,6 +330,11 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case playMsg:
 		return m, m.handlePlay(msg)
 	case tea.KeyPressMsg:
+		if m.viewMode == viewList && isListNavKey(msg) {
+			var cmd tea.Cmd
+			m.table, cmd = m.table.Update(msg)
+			return m, cmd
+		}
 		return m, m.handleKey(msg)
 	}
 
@@ -523,9 +536,9 @@ func (m *model) renderHeader() string {
 		mode = "PLAY"
 	}
 	left := lipgloss.JoinHorizontal(lipgloss.Left,
-		titleStyle.Render("CASIO"),
-		badgeStyle.Render("G-SHOCK"),
-		titleStyle.Render("AUDIO"),
+		titleStyle.Render("SIMPLE"),
+		badgeStyle.Render("AUDIO"),
+		titleStyle.Render("PLAYER"),
 	)
 	right := labelStyle.Render("MODE") + " " + valueStyle.Render(mode)
 	return lipgloss.JoinHorizontal(lipgloss.Left, left, "  ", right)
@@ -554,6 +567,24 @@ func (m *model) renderHelp() string {
 			keyStyle.Render("H/L") + " band  " +
 			keyStyle.Render("J/K") + " gain",
 	)
+}
+
+func (m *model) setViewMode(mode viewMode) {
+	m.viewMode = mode
+	if mode == viewList {
+		m.table.Focus()
+	} else {
+		m.table.Blur()
+	}
+}
+
+func isListNavKey(msg tea.KeyPressMsg) bool {
+	switch msg.String() {
+	case "up", "down", "j", "k", "pgup", "pgdown", "home", "end", "g", "G", "b", "f", "u", "d":
+		return true
+	default:
+		return false
+	}
 }
 
 func tickCmd() tea.Cmd {
