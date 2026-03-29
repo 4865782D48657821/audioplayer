@@ -40,8 +40,6 @@ var (
 			Background(colorBezel).
 			Foreground(colorLCD)
 	bezelStyle = lipgloss.NewStyle().
-			Border(lipgloss.BlockBorder()).
-			BorderForeground(colorOlive).
 			Padding(1, 2)
 	panelStyle = lipgloss.NewStyle().
 			Border(lipgloss.NormalBorder()).
