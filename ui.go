@@ -22,13 +22,62 @@ const (
 	maxWidth = 80
 )
 
-var helpStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#626262")).Render
+var (
+	colorBezel      = lipgloss.Color("#151515")
+	colorPanel      = lipgloss.Color("#0f140f")
+	colorOlive      = lipgloss.Color("#6c704d")
+	colorOliveDark  = lipgloss.Color("#3f442d")
+	colorLCD        = lipgloss.Color("#b7d6a0")
+	colorLCDMuted   = lipgloss.Color("#6a7b5f")
+	colorAccent     = lipgloss.Color("#f2d21a")
+	colorAccentDark = lipgloss.Color("#b99d11")
+	colorAlert      = lipgloss.Color("#d23b2a")
+)
+
+var (
+	baseStyle = lipgloss.NewStyle().
+			Background(colorBezel).
+			Foreground(colorLCD)
+	bezelStyle = lipgloss.NewStyle().
+			Border(lipgloss.BlockBorder()).
+			BorderForeground(colorOlive).
+			Padding(1, 2)
+	panelStyle = lipgloss.NewStyle().
+			Border(lipgloss.NormalBorder()).
+			BorderForeground(colorOliveDark).
+			Background(colorPanel).
+			Padding(1, 2)
+	titleStyle = lipgloss.NewStyle().
+			Foreground(colorBezel).
+			Background(colorAccent).
+			Bold(true).
+			Padding(0, 1)
+	badgeStyle = lipgloss.NewStyle().
+			Foreground(colorBezel).
+			Background(colorAlert).
+			Bold(true).
+			Padding(0, 1)
+	labelStyle = lipgloss.NewStyle().
+			Foreground(colorLCDMuted).
+			Bold(true)
+	valueStyle = lipgloss.NewStyle().
+			Foreground(colorLCD)
+	keyStyle = lipgloss.NewStyle().
+			Foreground(colorBezel).
+			Background(colorAccentDark).
+			Bold(true).
+			Padding(0, 1)
+	helpStyle = lipgloss.NewStyle().
+			Foreground(colorLCDMuted)
+)
+
 var spectrumBoxStyle = lipgloss.NewStyle().
-	Border(lipgloss.RoundedBorder()).
-	BorderForeground(lipgloss.Color("240")).
+	Border(lipgloss.NormalBorder()).
+	BorderForeground(colorOliveDark).
+	Background(colorPanel).
 	Padding(0, 1)
-var spectrumLabelStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("250")).Bold(true)
-var spectrumEmptyStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("238"))
+var spectrumLabelStyle = lipgloss.NewStyle().Foreground(colorLCDMuted).Bold(true)
+var spectrumEmptyStyle = lipgloss.NewStyle().Foreground(colorLCDMuted)
 
 type model struct {
 	dir          string
@@ -36,6 +85,7 @@ type model struct {
 	table        table.Model
 	progress     progress.Model
 	playingIndex int
+	viewMode     viewMode
 	nowPlaying   string
 	err          string
 	player       audioPlayer
@@ -46,6 +96,13 @@ type model struct {
 }
 
 type tickMsg time.Time
+
+type viewMode int
+
+const (
+	viewList viewMode = iota
+	viewDetail
+)
 
 func newTableModel() table.Model {
 	columns := []table.Column{
@@ -75,14 +132,15 @@ func newTableModel() table.Model {
 	s := table.DefaultStyles()
 	s.Header = s.Header.
 		BorderStyle(lipgloss.NormalBorder()).
-		BorderForeground(lipgloss.Color("240")).
+		BorderForeground(colorOliveDark).
 		BorderBottom(true).
-		Bold(false)
+		Bold(false).
+		Foreground(colorLCDMuted)
 
 	s.Selected = s.Selected.
-		Foreground(lipgloss.Color("229")).
-		Background(lipgloss.Color("57")).
-		Bold(false)
+		Foreground(colorBezel).
+		Background(colorAccent).
+		Bold(true)
 	t.SetStyles(s)
 	return t
 }
@@ -94,6 +152,7 @@ func initialModel(dir string) *model {
 		table:        newTableModel(),
 		progress:     progress.New(progress.WithDefaultBlend()),
 		playingIndex: -1,
+		viewMode:     viewList,
 		eqGains:      eqGains,
 	}
 }
@@ -165,6 +224,7 @@ func (m *model) handleReload(msg reloadMsg) tea.Cmd {
 		m.songs = nil
 		m.playingIndex = -1
 		m.nowPlaying = ""
+		m.viewMode = viewList
 		m.syncTableRows()
 		return nil
 	}
@@ -180,6 +240,7 @@ func (m *model) handleReload(msg reloadMsg) tea.Cmd {
 		m.playingIndex = -1
 		m.nowPlaying = ""
 		m.table.SetCursor(0)
+		m.viewMode = viewList
 	}
 	return nil
 }
@@ -189,6 +250,7 @@ func (m *model) handlePlay(msg playMsg) tea.Cmd {
 		m.err = msg.loadErr.Error()
 		m.playingIndex = -1
 		m.nowPlaying = ""
+		m.viewMode = viewList
 		m.syncTableRows()
 		return m.progress.SetPercent(0)
 	}
@@ -201,6 +263,7 @@ func (m *model) handlePlay(msg playMsg) tea.Cmd {
 		return nil
 	}
 	m.nowPlaying = filepath.Base(msg.path)
+	m.viewMode = viewDetail
 	m.syncTableRows()
 	return m.progress.SetPercent(m.playbackPercent())
 }
@@ -212,6 +275,9 @@ func (m *model) handleKey(msg tea.KeyPressMsg) tea.Cmd {
 		return tea.Quit
 	case "r":
 		return reloadCmd(m.dir)
+	case "b":
+		m.viewMode = viewList
+		return nil
 	case "-":
 		m.adjustVolume(-2)
 	case "=", "+":
@@ -224,7 +290,7 @@ func (m *model) handleKey(msg tea.KeyPressMsg) tea.Cmd {
 		m.adjustEQGain(-1.5)
 	case "k":
 		m.adjustEQGain(1.5)
-	case "enter", "space":
+	case "enter", "space", "p":
 		if len(m.songs) == 0 {
 			return nil
 		}
@@ -237,6 +303,7 @@ func (m *model) handleKey(msg tea.KeyPressMsg) tea.Cmd {
 			m.nowPlaying = ""
 			m.stopAudio()
 			m.playingIndex = -1
+			m.viewMode = viewList
 			m.syncTableRows()
 			return tea.Batch(reloadCmd(m.dir), m.progress.SetPercent(0))
 		}
@@ -288,33 +355,42 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 func (m *model) View() tea.View {
-	s := fmt.Sprintf("Audio files in %s\n\n", m.dir)
+	header := m.renderHeader()
+	var body string
+	switch m.viewMode {
+	case viewDetail:
+		body = lipgloss.JoinVertical(lipgloss.Left,
+			m.renderNowPlaying(),
+			m.progress.View(),
+			m.renderSongInfo(),
+			m.renderVolume(),
+			m.renderEQ(),
+		)
+		if len(m.spectrum) > 0 {
+			body = lipgloss.JoinVertical(lipgloss.Left, body, m.renderSpectrum())
+		}
+	default:
+		body = m.table.View()
+	}
 
 	if m.err != "" {
-		s += fmt.Sprintf("Error: %s\n\n", m.err)
+		body = lipgloss.JoinVertical(lipgloss.Left, body, labelStyle.Render("ERR")+" "+valueStyle.Render(m.err))
 	}
 
 	if len(m.songs) == 0 {
-		s += "No audio files found. \n\n"
-		s += "Press r to rescan, q to quit. \n"
-		return tea.NewView(s)
+		body = lipgloss.JoinVertical(lipgloss.Left,
+			labelStyle.Render("NO FILES"),
+			valueStyle.Render("Press R to rescan or Q to quit."),
+		)
 	}
 
-	s += lipgloss.NewStyle().PaddingLeft(padding).Render(m.table.View())
-
-	if m.nowPlaying != "" {
-		s += "\n\n" + lipgloss.NewStyle().PaddingLeft(padding).Render(fmt.Sprintf("Now playing: %s", m.nowPlaying))
-		s += "\n" + lipgloss.NewStyle().PaddingLeft(padding).Render(m.progress.View())
-		s += "\n" + lipgloss.NewStyle().PaddingLeft(padding).Render(m.renderVolume())
-		s += "\n" + lipgloss.NewStyle().PaddingLeft(padding).Render(m.renderEQ())
-		if len(m.spectrum) > 0 {
-			s += "\n" + lipgloss.NewStyle().PaddingLeft(padding).Render(m.renderSpectrum())
-		}
-	}
-
-	s += "\n\n" + lipgloss.NewStyle().PaddingLeft(padding).Render(helpStyle("Enter play/stop, r rescan, q quit, +/- volume, h/l band, j/k gain."))
-
-	return tea.NewView(s)
+	content := lipgloss.JoinVertical(
+		lipgloss.Left,
+		header,
+		panelStyle.Render(body),
+		m.renderHelp(),
+	)
+	return tea.NewView(baseStyle.Render(bezelStyle.Render(content)))
 }
 
 func (m *model) adjustVolume(delta float64) {
@@ -341,22 +417,61 @@ func (m *model) adjustEQGain(delta float64) {
 }
 
 func (m *model) renderVolume() string {
-	return fmt.Sprintf("Volume: %.1f dB", m.volumeDB)
+	pct := 0.0
+	if maxVolumeDB > minVolumeDB {
+		pct = (m.volumeDB - minVolumeDB) / (maxVolumeDB - minVolumeDB)
+	}
+	barWidth := 12
+	filled := int(math.Round(pct * float64(barWidth)))
+	if filled < 0 {
+		filled = 0
+	}
+	if filled > barWidth {
+		filled = barWidth
+	}
+	meter := strings.Repeat("|", filled) + strings.Repeat(".", barWidth-filled)
+	return fmt.Sprintf("%s [%s] %s", labelStyle.Render("VOL"), meter, valueStyle.Render(fmt.Sprintf("%.1f dB", m.volumeDB)))
 }
 
 func (m *model) renderEQ() string {
 	if len(m.eqGains) == 0 {
-		return "EQ: (none)"
+		return labelStyle.Render("EQ") + " " + valueStyle.Render("(none)")
 	}
 	parts := make([]string, 0, len(m.eqGains))
 	for i, gain := range m.eqGains {
 		label := fmt.Sprintf("%.0fHz %.1fdB", eqFrequencies[i], gain)
 		if i == m.eqSelected {
-			label = ">" + label + "<"
+			label = keyStyle.Render(label)
+		} else {
+			label = valueStyle.Render(label)
 		}
 		parts = append(parts, label)
 	}
-	return "EQ: " + strings.Join(parts, " | ")
+	return labelStyle.Render("EQ") + " " + strings.Join(parts, " ")
+}
+
+func (m *model) renderNowPlaying() string {
+	if m.nowPlaying == "" {
+		return labelStyle.Render("NOW") + " " + valueStyle.Render("(none)")
+	}
+	return labelStyle.Render("NOW") + " " + valueStyle.Render(m.nowPlaying)
+}
+
+func (m *model) renderSongInfo() string {
+	if m.playingIndex < 0 || m.playingIndex >= len(m.songs) {
+		return labelStyle.Render("INFO") + " " + valueStyle.Render("(none)")
+	}
+	track := "—"
+	if m.songs[m.playingIndex].Track > 0 {
+		track = fmt.Sprintf("%d", m.songs[m.playingIndex].Track)
+	}
+	info := fmt.Sprintf("%s | %s | %s | Track %s",
+		m.songs[m.playingIndex].Title,
+		m.songs[m.playingIndex].Artist,
+		m.songs[m.playingIndex].Album,
+		track,
+	)
+	return labelStyle.Render("INFO") + " " + valueStyle.Render(info)
 }
 
 func (m *model) renderSpectrum() string {
@@ -392,14 +507,53 @@ func (m *model) renderSpectrum() string {
 func spectrumColor(level float64) color.Color {
 	switch {
 	case level >= 0.75:
-		return lipgloss.Color("196")
+		return colorAlert
 	case level >= 0.5:
-		return lipgloss.Color("208")
+		return colorAccent
 	case level >= 0.25:
-		return lipgloss.Color("190")
+		return colorLCD
 	default:
-		return lipgloss.Color("70")
+		return colorLCDMuted
 	}
+}
+
+func (m *model) renderHeader() string {
+	mode := "LIST"
+	if m.viewMode == viewDetail {
+		mode = "PLAY"
+	}
+	left := lipgloss.JoinHorizontal(lipgloss.Left,
+		titleStyle.Render("CASIO"),
+		badgeStyle.Render("G-SHOCK"),
+		titleStyle.Render("AUDIO"),
+	)
+	right := labelStyle.Render("MODE") + " " + valueStyle.Render(mode)
+	return lipgloss.JoinHorizontal(lipgloss.Left, left, "  ", right)
+}
+
+func (m *model) renderHelp() string {
+	if len(m.songs) == 0 {
+		return helpStyle.Render(" ")
+	}
+	if m.viewMode == viewDetail {
+		return helpStyle.Render(
+			keyStyle.Render("B") + " back  " +
+				keyStyle.Render("P") + " play  " +
+				keyStyle.Render("R") + " rescan  " +
+				keyStyle.Render("Q") + " quit  " +
+				keyStyle.Render("+/-") + " vol  " +
+				keyStyle.Render("H/L") + " band  " +
+				keyStyle.Render("J/K") + " gain",
+		)
+	}
+	return helpStyle.Render(
+		keyStyle.Render("P") + " play  " +
+			keyStyle.Render("R") + " rescan  " +
+			keyStyle.Render("Q") + " quit  " +
+			keyStyle.Render("+/-") + " vol  " +
+			keyStyle.Render("H/L") + " band  " +
+			keyStyle.Render("J/K") + " gain",
+	)
 }
 
 func tickCmd() tea.Cmd {
