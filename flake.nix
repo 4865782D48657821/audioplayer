@@ -15,6 +15,14 @@
 			devShells.default = pkgs.mkShell {
 				buildInputs = with pkgs;  [
 					go
+					pkg-config
+					alsa-lib
+					gotools
+					gopls
+					delve
+					golangci-lint
+					gomodifytags
+					impl
 					git
 					nodePackages.prettier
 				];
